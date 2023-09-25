@@ -29,17 +29,23 @@ class HacsDataset(Dataset):
             crop_ratio,  # a tuple (e.g., (0.9, 1.0)) for random cropping
             input_dim,  # input feat dim
             num_classes,  # number of action categories
+            file_prefix,  # feature file prefix if any
             file_ext,  # feature file extension if any
             force_upsampling,  # force to upsample to max_seq_len
             backbone_type,  # feat_type
+            additional_feat_folder=None
     ):
-        # file path
-        if backbone_type != 'tsp':
+        # todo file path, make it general
+        if backbone_type == 'slowfast':
             feat_folder = os.path.join(feat_folder, split[0])
         assert os.path.exists(feat_folder) and os.path.exists(json_file)
         assert isinstance(split, tuple) or isinstance(split, list)
         assert crop_ratio == None or len(crop_ratio) == 2
         self.feat_folder = feat_folder
+        if file_prefix is not None:
+            self.file_prefix = file_prefix
+        else:
+            self.file_prefix = ''
         self.backbone_type = backbone_type
         self.file_ext = file_ext
         self.json_file = json_file
@@ -62,6 +68,8 @@ class HacsDataset(Dataset):
         self.num_classes = num_classes
         self.label_dict = None
         self.crop_ratio = crop_ratio
+        self.use_addtional_feats = additional_feat_folder is not None
+        self.additional_feat_folder = additional_feat_folder
 
         # load database and select the subset
         dict_db, label_dict = self._load_json_db(self.json_file)
@@ -144,19 +152,26 @@ class HacsDataset(Dataset):
         # instead the model will need to decide how to batch / preporcess the data
         video_item = self.data_list[idx]
 
-        # load features
+        # todo load features, make it general
         if self.backbone_type == 'i3d':
+            with h5py.File(self.feat_folder, 'r') as h5_fid:
+                feats = np.asarray(
+                    h5_fid[video_item['id']][()],
+                    dtype=np.float32
+                )
+        elif self.backbone_type == 'slowfast':
+            filename = os.path.join(self.feat_folder, video_item['id'] + self.file_ext)
+            feats = np.load(filename, allow_pickle=True)
+            # 1 x 2304 x T --> T x 2304
+            feats = torch.concat([feats['slow_feature'], feats['fast_feature']], dim=1).squeeze(0).transpose(0, 1)
+        elif self.backbone_type == 'tsp' or self.backbone_type == 'pose':
             filename = os.path.join(self.feat_folder, self.file_prefix + video_item['id'] + self.file_ext)
             feats = np.load(filename, allow_pickle=True).astype(np.float32)
-        else:
-            if self.backbone_type == 'slowfast':
-                filename = os.path.join(self.feat_folder, video_item['id'] + self.file_ext)
-                feats = np.load(filename, allow_pickle=True)
-                # 1 x 2304 x T --> T x 2304
-                feats = torch.concat([feats['slow_feature'], feats['fast_feature']], dim=1).squeeze(0).transpose(0, 1)
-            elif self.backbone_type == 'tsp':
-                filename = os.path.join(self.feat_folder, 'v_' + video_item['id'] + self.file_ext)
-                feats = np.load(filename, allow_pickle=True)
+        elif self.backbone_type == 'videomaev2':
+            filename = os.path.join(self.feat_folder, self.file_prefix + video_item['id'] + self.file_ext)
+            # feats = torch.load(filename)
+            feats = np.load(filename, allow_pickle=True).astype(np.float32)
+            # 100 x 1408
 
         # we support both fixed length features / variable length features
         if self.feat_stride > 0 and (not self.force_upsampling):
@@ -201,6 +216,23 @@ class HacsDataset(Dataset):
             )
             feats = resize_feats.squeeze(0)
 
+        if self.use_addtional_feats:
+
+            additional_file_name = self.file_prefix + video_item['id'] + '.npy'
+            # T, kpt_cls, height, width / T, dim
+            additional_feats = np.load(os.path.join(self.additional_feat_folder, additional_file_name),
+                                       allow_pickle=True)
+            additional_feats = torch.from_numpy(additional_feats).to(torch.float32)
+
+            # todo vector
+            additional_feats = additional_feats.flatten(1)  # T, cls, height* width
+            additional_feats = additional_feats.transpose(0, 1)  # cls*height* width, T
+            # a trick: make the interpolation determinant
+            additional_feats = \
+                F.interpolate(additional_feats[None], feats.shape[-1], mode='linear', align_corners=True)[0]
+        else:
+            additional_feats = None
+
         # convert time stamp (in second) into temporal feature grids
         # ok to have small negative values here
         if video_item['segments'] is not None:
@@ -218,11 +250,15 @@ class HacsDataset(Dataset):
                         # skip an action outside of the feature map
                         continue
                     # truncate an action boundary
-                    valid_seg_list.append(seg.clamp(max=feat_len))
+                    valid_seg_list.append(seg.clamp(min=0, max=feat_len))
                     # some weird bug here if not converting to size 1 tensor
                     valid_label_list.append(label.view(1))
-                segments = torch.stack(valid_seg_list, dim=0)
-                labels = torch.cat(valid_label_list)
+                if len(valid_seg_list) == 0:
+                    # print(feat_len, segments, video_item)
+                    segments, labels = None, None
+                else:
+                    segments = torch.stack(valid_seg_list, dim=0)
+                    labels = torch.cat(valid_label_list)
         else:
             segments, labels = None, None
 
@@ -234,7 +270,9 @@ class HacsDataset(Dataset):
                      'fps': video_item['fps'],
                      'duration': video_item['duration'],
                      'feat_stride': feat_stride,
-                     'feat_num_frames': num_frames}
+                     'feat_num_frames': num_frames,
+                     'additional_feats': additional_feats,
+                     }
 
         # no truncation is needed
         # truncate the features during training

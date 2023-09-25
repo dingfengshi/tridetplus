@@ -2,7 +2,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .blocks import (get_sinusoid_encoding, MaskedConv1D, ConvBlock, LayerNorm, SGPBlock)
+from .blocks import (get_sinusoid_encoding, MaskedConv1D, ConvBlock, LayerNorm, SGPBlock, LocalMaskedMHCA)
 from .models import register_backbone
 
 
@@ -28,6 +28,7 @@ class SGPBackbone(nn.Module):
             k=1.5,  # the K in SGP
             init_conv_vars=1,  # initialization of gaussian variance for the weight in SGP
             use_abs_pe=False,  # use absolute position embedding
+            additional_fature=False
     ):
         super().__init__()
         assert len(arch) == 3
@@ -38,6 +39,7 @@ class SGPBackbone(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.scale_factor = scale_factor
         self.use_abs_pe = use_abs_pe
+        self.additional_fature = additional_fature
 
         # position embedding (1, C, T), rescaled by 1/sqrt(n_embd)
         if self.use_abs_pe:
@@ -76,6 +78,15 @@ class SGPBackbone(nn.Module):
             self.branch.append(SGPBlock(n_embd, self.sgp_win_size[1 + idx], self.scale_factor, path_pdrop=path_pdrop,
                                         n_hidden=sgp_mlp_dim, downsample_type=downsample_type, k=k,
                                         init_conv_vars=init_conv_vars))
+
+        # todo additional branch
+        if self.additional_fature:
+            self.additional_branch = nn.ModuleList()
+            for idx in range(arch[2]):
+                self.additional_branch.append(SGPBlock(n_embd, 1, self.scale_factor, path_pdrop=path_pdrop,
+                                                       n_hidden=sgp_mlp_dim, downsample_type=downsample_type, k=1.5,
+                                                       init_conv_vars=init_conv_vars))
+
         # init weights
         self.apply(self.__init_weights__)
 
@@ -85,15 +96,21 @@ class SGPBackbone(nn.Module):
             if module.bias is not None:
                 torch.nn.init.constant_(module.bias, 0.)
 
-    def forward(self, x, mask):
+    def forward(self, x, mask, addtional_feature=None, additional_only=False):
         # x: batch size, feature channel, sequence length,
         # mask: batch size, 1, sequence length (bool)
         B, C, T = x.size()
 
-        # embedding network
-        for idx in range(len(self.embd)):
-            x, mask = self.embd[idx](x, mask)
-            x = self.relu(self.embd_norm[idx](x))
+        if not additional_only:
+            # embedding network
+            for idx in range(len(self.embd)):
+                x, mask = self.embd[idx](x, mask)
+                x = self.relu(self.embd_norm[idx](x))
+
+        # merge feature
+        if addtional_feature is not None:
+            if additional_only:
+                x = addtional_feature
 
         # training: using fixed length position embeddings
         if self.use_abs_pe and self.training:
@@ -119,17 +136,24 @@ class SGPBackbone(nn.Module):
         # prep for outputs
         out_feats = tuple()
         out_masks = tuple()
+        out_add_feats = tuple()
         # 1x resolution
         out_feats += (x,)
         out_masks += (mask,)
+
+        if addtional_feature is not None:
+            out_add_feats += (addtional_feature,)
 
         # main branch with downsampling
         for idx in range(len(self.branch)):
             x, mask = self.branch[idx](x, mask)
             out_feats += (x,)
             out_masks += (mask,)
+            if addtional_feature is not None:
+                addtional_feature, _ = self.additional_branch[idx](addtional_feature, mask)
+                out_add_feats += (addtional_feature,)
 
-        return out_feats, out_masks
+        return out_feats, out_masks, out_add_feats
 
 
 @register_backbone("conv")

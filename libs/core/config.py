@@ -88,7 +88,8 @@ DEFAULTS = {
         "iou_weight_power": 1.,
         # add gaussian noise with the variance, play a similar role to position embedding
         "input_noise": 0,
-
+        "multi_label": False,
+        "additional_only": False
     },
     "train_cfg": {
         # radius | none (if to use center sampling)
@@ -161,7 +162,8 @@ def load_default_config():
 def _update_config(config):
     # fill in derived fields
     config["model"]["input_dim"] = config["dataset"]["input_dim"]
-    config["model"]["num_classes"] = config["dataset"]["num_classes"]
+    if not config['model'].get("num_classes"):
+        config["model"]["num_classes"] = config["dataset"]["num_classes"]
     config["model"]["max_seq_len"] = config["dataset"]["max_seq_len"]
     config["model"]["train_cfg"] = config["train_cfg"]
     config["model"]["test_cfg"] = config["test_cfg"]

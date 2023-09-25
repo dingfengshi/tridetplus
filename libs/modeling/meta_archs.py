@@ -2,6 +2,7 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.nn.utils.rnn import pad_sequence
 
 from .blocks import MaskedConv1D, Scale, LayerNorm
 from .losses import ctr_diou_loss_1d, sigmoid_focal_loss, ctr_giou_loss_1d
@@ -206,7 +207,11 @@ class TriDet(nn.Module):
             use_trident_head,  # if use the Trident-head
             num_classes,  # number of action classes
             train_cfg,  # other cfg for training
-            test_cfg  # other cfg for testing
+            test_cfg,  # other cfg for testing
+            multi_label,
+            additional_fature=False,
+            additional_dim=-1,
+            additional_only=False
     ):
         super().__init__()
         # re-distribute params to backbone / neck / head
@@ -221,6 +226,7 @@ class TriDet(nn.Module):
         # #classes = num_classes + 1 (background) with last category as background
         # e.g., num_classes = 10 -> 0, 1, ..., 9 as actions, 10 as background
         self.num_classes = num_classes
+        self.multi_label = multi_label
 
         # check the feature pyramid and local attention window size
         self.max_seq_len = max_seq_len
@@ -260,6 +266,8 @@ class TriDet(nn.Module):
         self.test_voting_thresh = test_cfg['voting_thresh']
         self.num_bins = num_bins
         self.use_trident_head = use_trident_head
+        self.additional_fature = additional_fature
+        self.additional_only = additional_only
 
         # we will need a better way to dispatch the params to backbones / necks
         # backbone network: conv + transformer
@@ -281,7 +289,8 @@ class TriDet(nn.Module):
                     'sgp_win_size': self.sgp_win_size,
                     'use_abs_pe': use_abs_pe,
                     'k': k,
-                    'init_conv_vars': init_conv_vars
+                    'init_conv_vars': init_conv_vars,
+                    'additional_fature': self.additional_fature
                 }
             )
         else:
@@ -293,7 +302,7 @@ class TriDet(nn.Module):
                     'n_embd_ks': embd_kernel_size,
                     'arch': backbone_arch,
                     'scale_factor': scale_factor,
-                    'with_ln': embd_with_ln
+                    'with_ln': embd_with_ln,
                 }
             )
 
@@ -332,6 +341,11 @@ class TriDet(nn.Module):
         )
 
         if use_trident_head:
+            if self.multi_label:
+                model_bins = (num_bins + 1) * self.num_classes - 1
+            else:
+                model_bins = num_bins
+
             self.start_head = ClsHead(
                 fpn_dim, head_dim, self.num_classes,
                 kernel_size=boudary_kernel_size,
@@ -356,16 +370,71 @@ class TriDet(nn.Module):
                 kernel_size=head_kernel_size,
                 num_layers=head_num_layers,
                 with_ln=head_with_ln,
-                num_bins=num_bins
+                num_bins=model_bins
             )
         else:
+            if self.multi_label:
+                model_bins = self.num_classes - 1
+            else:
+                model_bins = 0
             self.reg_head = RegHead(
                 fpn_dim, head_dim, len(self.fpn_strides),
                 kernel_size=head_kernel_size,
                 num_layers=head_num_layers,
                 with_ln=head_with_ln,
-                num_bins=0
+                num_bins=model_bins
             )
+
+        if self.additional_fature:
+            self.pose_conv = False
+            if self.pose_conv:
+                # bz*T, cls, height, width
+                self.additional_embed = nn.Sequential(
+                    nn.Conv2d(7,
+                              embd_dim,
+                              kernel_size=(56, 56),
+                              stride=(1, 1),
+                              padding=(0, 0),
+                              bias=True,
+                              ),
+                    nn.GroupNorm(16, embd_dim),
+                    nn.ReLU(),
+                    nn.Conv2d(embd_dim,
+                              embd_dim,
+                              kernel_size=(1, 1),
+                              stride=(1, 1),
+                              padding=(0, 0),
+                              bias=True,
+                              ),
+                    nn.GroupNorm(16, embd_dim),
+                    nn.ReLU(),
+                    nn.Conv2d(embd_dim,
+                              embd_dim,
+                              kernel_size=(1, 1),
+                              stride=(1, 1),
+                              padding=(0, 0),
+                              bias=True,
+                              ),
+                    nn.GroupNorm(16, embd_dim),
+                    nn.ReLU(),
+                )
+
+                self.pose_temporal = nn.Sequential(
+                    nn.Conv1d(embd_dim, embd_dim, 3, 1, 1
+                              ),
+                    nn.ReLU()
+                )
+
+            else:
+                self.additional_embed = nn.Sequential(
+                    nn.Conv1d(additional_dim, embd_dim, kernel_size=1),
+                    nn.GroupNorm(16, embd_dim),
+                    nn.ReLU(),
+                    nn.Conv1d(embd_dim, embd_dim, kernel_size=1),
+                    nn.GroupNorm(16, embd_dim),
+                    nn.ReLU()
+                )
+
 
         # maintain an EMA of #foreground to stabilize the loss normalizer
         # useful for small mini-batch training
@@ -378,15 +447,12 @@ class TriDet(nn.Module):
         # will throw an error if parameters are on different devices
         return list(set(p.device for p in self.parameters()))[0]
 
-    def decode_offset(self, out_offsets, pred_start_neighbours, pred_end_neighbours):
-        # decode the offset value from the network output
-        # If a normal regression head is used, the offsets is predicted directly in the out_offsets.
-        # If the Trident-head is used, the predicted offset is calculated using the value from
-        # center offset head (out_offsets), start boundary head (pred_left) and end boundary head (pred_right)
-
+    def decode_offset(self, out_offsets, pred_left, pred_right):
         if not self.use_trident_head:
             if self.training:
                 out_offsets = torch.cat(out_offsets, dim=1)
+            if self.multi_label:
+                out_offsets = out_offsets.reshape(out_offsets.shape[:-1] + (self.num_classes, -1))
             return out_offsets
 
         else:
@@ -394,25 +460,33 @@ class TriDet(nn.Module):
             # from each FPN level. Each feature with shape [batchsize, T_level, (Num_bin+1)x2].
             # For validation, the out_offsets is a feature with shape [T_level, (Num_bin+1)x2]
             if self.training:
-                out_offsets = torch.cat(out_offsets, dim=1)
-                out_offsets = out_offsets.view(out_offsets.shape[:2] + (2, -1))
-                pred_start_neighbours = torch.cat(pred_start_neighbours, dim=1)
-                pred_end_neighbours = torch.cat(pred_end_neighbours, dim=1)
-
-                pred_left_dis = torch.softmax(pred_start_neighbours + out_offsets[:, :, :1, :], dim=-1)
-                pred_right_dis = torch.softmax(pred_end_neighbours + out_offsets[:, :, 1:, :], dim=-1)
-
+                pred_left = torch.cat(pred_left, dim=1)
+                pred_right = torch.cat(pred_right, dim=1)
+                if self.multi_label:
+                    out_offsets = torch.cat(out_offsets, dim=1)
+                    out_offsets = out_offsets.view(out_offsets.shape[:2] + (2, self.num_classes, -1))
+                    pred_left_dis = torch.softmax(pred_left + out_offsets[:, :, 0, :], dim=-1)
+                    pred_right_dis = torch.softmax(pred_right + out_offsets[:, :, 1, :], dim=-1)
+                else:
+                    out_offsets = torch.cat(out_offsets, dim=1)
+                    out_offsets = out_offsets.view(out_offsets.shape[:2] + (2, -1))
+                    pred_left_dis = torch.softmax(pred_left + out_offsets[:, :, :1, :], dim=-1)
+                    pred_right_dis = torch.softmax(pred_right + out_offsets[:, :, 1:, :], dim=-1)
             else:
-                out_offsets = out_offsets.view(out_offsets.shape[0], 2, -1)
-                pred_left_dis = torch.softmax(pred_start_neighbours + out_offsets[None, :, 0, :], dim=-1)
-                pred_right_dis = torch.softmax(pred_end_neighbours + out_offsets[None, :, 1, :], dim=-1)
+                if self.multi_label:
+                    out_offsets = out_offsets.view(out_offsets.shape[0], 2, self.num_classes, -1)
+                    pred_left_dis = torch.softmax(pred_left + out_offsets[:, 0, :], dim=-1)
+                    pred_right_dis = torch.softmax(pred_right + out_offsets[:, 1, :], dim=-1)
+                else:
+                    out_offsets = out_offsets.view(out_offsets.shape[0], 2, -1)
+                    pred_left_dis = torch.softmax(pred_left + out_offsets[None, :, 0, :], dim=-1)
+                    pred_right_dis = torch.softmax(pred_right + out_offsets[None, :, 1, :], dim=-1)
 
             max_range_num = pred_left_dis.shape[-1]
 
-            left_range_idx = torch.arange(max_range_num - 1, -1, -1, device=pred_start_neighbours.device,
+            left_range_idx = torch.arange(max_range_num - 1, -1, -1, device=pred_left.device,
                                           dtype=torch.float).unsqueeze(-1)
-            right_range_idx = torch.arange(max_range_num, device=pred_end_neighbours.device,
-                                           dtype=torch.float).unsqueeze(-1)
+            right_range_idx = torch.arange(max_range_num, device=pred_right.device, dtype=torch.float).unsqueeze(-1)
 
             pred_left_dis = pred_left_dis.masked_fill(torch.isnan(pred_right_dis), 0)
             pred_right_dis = pred_right_dis.masked_fill(torch.isnan(pred_right_dis), 0)
@@ -423,12 +497,23 @@ class TriDet(nn.Module):
             return torch.cat([decoded_offset_left, decoded_offset_right], dim=-1)
 
     def forward(self, video_list):
+        # drop the data without annotation first
+        video_list = [each for each in video_list if each['segments'] is not None]
+
         # batch the video list into feats (B, C, T) and masks (B, 1, T)
-        batched_inputs, batched_masks = self.preprocessing(video_list)
+        batched_inputs, batched_masks, batched_additional_feats = self.preprocessing(video_list)
+
+        if self.additional_fature:
+            batched_additional_feats = self.additional_embed(batched_additional_feats)
+        else:
+            batched_additional_feats = None
 
         # forward the network (backbone -> neck -> heads)
-        feats, masks = self.backbone(batched_inputs, batched_masks)
-        fpn_feats, fpn_masks = self.neck(feats, masks)
+        batched_inputs, batched_masks, batched_add_feats = self.backbone(batched_inputs, batched_masks,
+                                                                         batched_additional_feats, self.additional_only)
+
+        fpn_feats, fpn_masks = self.neck(batched_inputs, batched_masks)
+
 
         # compute the point coordinate along the FPN
         # this is used for computing the GT or decode the final results
@@ -438,6 +523,9 @@ class TriDet(nn.Module):
 
         # out_cls: List[B, #cls + 1, T_i]
         out_cls_logits = self.cls_head(fpn_feats, fpn_masks)
+
+        if self.additional_fature and not self.additional_only:
+            fpn_feats = [feat + add_feat for feat, add_feat in zip(fpn_feats, batched_add_feats)]
 
         if self.use_trident_head:
             out_lb_logits = self.start_head(fpn_feats, fpn_masks)
@@ -494,8 +582,14 @@ class TriDet(nn.Module):
             Generate batched features and masks from a list of dict items
         """
         feats = [x['feats'] for x in video_list]
-        feats_lens = torch.as_tensor([feat.shape[-1] for feat in feats])
+        feats_lens = torch.as_tensor([feat.shape[-1] for feat in feats], device=feats[0].device)
         max_len = feats_lens.max(0).values.item()
+
+        if self.additional_fature:
+            additional_feats = [x['additional_feats'] for x in video_list]
+            additional_frames_num = [x.shape[-1] for x in additional_feats]
+
+            additional_frames_num = torch.as_tensor(additional_frames_num)
 
         if self.training:
             assert max_len <= self.max_seq_len, "Input length must be smaller than max_seq_len during training"
@@ -504,10 +598,20 @@ class TriDet(nn.Module):
             # batch input shape B, C, T
             batch_shape = [len(feats), feats[0].shape[0], max_len]
             batched_inputs = feats[0].new_full(batch_shape, padding_val)
-            for feat, pad_feat in zip(feats, batched_inputs):
-                pad_feat[..., :feat.shape[-1]].copy_(feat)
+
+            if self.additional_fature:
+                batch_add_shape = (len(additional_feats), additional_feats[0].shape[0], max_len)
+                batched_addfeat = additional_feats[0].new_full(batch_add_shape, 0.)
+
+                for feat, pad_feat, add_feat, pose_pad_feat in zip(feats, batched_inputs, additional_feats,
+                                                                   batched_addfeat):
+                    pad_feat[..., :feat.shape[-1]].copy_(feat)
+                    pose_pad_feat[..., :add_feat.shape[1]].copy_(add_feat)
+            else:
+                for feat, pad_feat in zip(feats, batched_inputs):
+                    pad_feat[..., :feat.shape[-1]].copy_(feat)
+
             if self.input_noise > 0:
-                # trick, adding noise slightly increases the variability between input features.
                 noise = torch.randn_like(batched_inputs) * self.input_noise
                 batched_inputs += noise
         else:
@@ -522,14 +626,20 @@ class TriDet(nn.Module):
             padding_size = [0, max_len - feats_lens[0]]
             batched_inputs = F.pad(feats[0], padding_size, value=padding_val).unsqueeze(0)
 
+            if self.additional_fature:
+                pose_padding_size = [0, max_len - additional_frames_num[0]]
+                batched_addfeat = F.pad(additional_feats[0], pose_padding_size, value=padding_val).unsqueeze(0)
+
         # generate the mask
-        batched_masks = torch.arange(max_len)[None, :] < feats_lens[:, None]
+        batched_masks = torch.arange(max_len, device=batched_inputs.device)[None, :] < feats_lens[:, None]
 
         # push to device
-        batched_inputs = batched_inputs.to(self.device)
-        batched_masks = batched_masks.unsqueeze(1).to(self.device)
+        batched_masks = batched_masks.unsqueeze(1)
 
-        return batched_inputs, batched_masks
+        if not self.additional_fature:
+            batched_addfeat = None
+
+        return batched_inputs, batched_masks, batched_addfeat
 
     @torch.no_grad()
     def label_points(self, points, gt_segments, gt_labels):
@@ -612,25 +722,48 @@ class TriDet(nn.Module):
         # pick the one with the shortest duration (easiest to regress)
         lens.masked_fill_(inside_gt_seg_mask == 0, float('inf'))
         lens.masked_fill_(inside_regress_range == 0, float('inf'))
-        # F T x N -> F T
-        min_len, min_len_inds = lens.min(dim=1)
 
-        # corner case: multiple actions with very similar durations (e.g., THUMOS14)
-        min_len_mask = torch.logical_and(
-            (lens <= (min_len[:, None] + 1e-3)), (lens < float('inf'))
-        ).to(reg_targets.dtype)
+        if self.multi_label:
+            len_mask = (lens < float('inf')).to(reg_targets.dtype)  # FT x N
 
-        # cls_targets: F T x C; reg_targets F T x 2
-        gt_label_one_hot = F.one_hot(
-            gt_label, self.num_classes
-        ).to(reg_targets.dtype)
-        cls_targets = min_len_mask @ gt_label_one_hot
-        # to prevent multiple GT actions with the same label and boundaries
-        cls_targets.clamp_(min=0.0, max=1.0)
-        # OK to use min_len_inds
-        reg_targets = reg_targets[range(num_pts), min_len_inds]
-        # normalization based on stride
-        reg_targets /= concat_points[:, 3, None]
+            # cls_targets: F T x C; reg_targets F T x C x 2
+            gt_label_one_hot = F.one_hot(gt_label, self.num_classes).to(reg_targets.dtype)  # N x C
+            cls_targets = len_mask @ gt_label_one_hot
+            # to prevent multiple GT actions with the same label and boundaries
+            cls_targets.clamp_(min=0.0, max=1.0)
+            # FT x N x 2  --> FT x C x 2
+            len_mask = len_mask.bool()
+            pos_t_idx, pos_gt_idx = torch.where(len_mask > 0)
+            pos_cls_idx = gt_label[pos_gt_idx]
+            multi_target = torch.zeros((num_pts, self.num_classes, 2), device=reg_targets.device)
+            multi_target[pos_t_idx, pos_cls_idx] = reg_targets[pos_t_idx, pos_gt_idx]
+            # normalization based on stride
+            multi_target /= concat_points[:, 3, None, None]
+
+            return cls_targets, multi_target
+
+
+        else:
+            # F T x N -> F T
+            min_len, min_len_inds = lens.min(dim=1)
+
+            # corner case: multiple actions with very similar durations (e.g., THUMOS14)
+            min_len_mask = torch.logical_and(
+                (lens <= (min_len[:, None] + 1e-3)), (lens < float('inf'))
+            ).to(reg_targets.dtype)
+
+            # cls_targets: F T x C; reg_targets F T x 2
+            gt_label_one_hot = F.one_hot(
+                gt_label, self.num_classes
+            ).to(reg_targets.dtype)
+            cls_targets = min_len_mask @ gt_label_one_hot
+
+            # to prevent multiple GT actions with the same label and boundaries
+            cls_targets.clamp_(min=0.0, max=1.0)
+            # OK to use min_len_inds
+            reg_targets = reg_targets[range(num_pts), min_len_inds]
+            # normalization based on stride
+            reg_targets /= concat_points[:, 3, None]
 
         return cls_targets, reg_targets
 
@@ -669,7 +802,10 @@ class TriDet(nn.Module):
         # 1. classification loss
         # stack the list -> (B, FT) -> (# Valid, )
         gt_cls = torch.stack(gt_cls_labels)
-        pos_mask = torch.logical_and((gt_cls.sum(-1) > 0), valid_mask)
+        if self.multi_label:
+            pos_mask = torch.logical_and((gt_cls > 0), valid_mask.unsqueeze(-1))
+        else:
+            pos_mask = torch.logical_and((gt_cls.sum(-1) > 0), valid_mask)
 
         decoded_offsets = self.decode_offset(out_offsets, out_start_logits, out_end_logits)  # bz, stack_T, num_class, 2
         decoded_offsets = decoded_offsets[pos_mask]
@@ -812,7 +948,7 @@ class TriDet(nn.Module):
         cls_idxs_all = []
 
         # loop over fpn levels
-        for cls_i, offsets_i, pts_i, mask_i, sb_cls_i, eb_cls_i in zip(
+        for cls_i, offsets_i, pts_i, mask_i, lb_cls_i, rb_cls_i in zip(
                 out_cls_logits, out_offsets, points, fpn_masks, lb_logits_per_vid, rb_logits_per_vid
         ):
             pred_prob = (cls_i.sigmoid() * mask_i.unsqueeze(-1)).flatten()
@@ -835,35 +971,38 @@ class TriDet(nn.Module):
             )
             cls_idxs = torch.fmod(topk_idxs, self.num_classes)
 
-            # 3. For efficiency, pad the boarder head with num_bins zeros (Pad left for start branch and Pad right
-            # for end branch). Then we re-arrange the output of boundary branch to [class_num, T, num_bins + 1 (the
-            # neighbour bin for each instant)]. In this way, the output can be directly added to the center offset
-            # later.
             if self.use_trident_head:
                 # pad the boarder
-                x = (F.pad(sb_cls_i, (self.num_bins, 0), mode='constant', value=0)).unsqueeze(-1)  # pad left
+                x = (F.pad(lb_cls_i, (self.num_bins, 0), mode='constant', value=0)).unsqueeze(-1)  # pad left
                 x_size = list(x.size())  # cls_num, T+num_bins, 1
                 x_size[-1] = self.num_bins + 1
                 x_size[-2] = x_size[-2] - self.num_bins  # cls_num, T, num_bins + 1
                 x_stride = list(x.stride())
                 x_stride[-2] = x_stride[-1]
 
-                pred_start_neighbours = x.as_strided(size=x_size, stride=x_stride)
+                left = x.as_strided(size=x_size, stride=x_stride)
 
-                x = (F.pad(eb_cls_i, (0, self.num_bins), mode='constant', value=0)).unsqueeze(-1)  # pad right
-                pred_end_neighbours = x.as_strided(size=x_size, stride=x_stride)
+                x = (F.pad(rb_cls_i, (0, self.num_bins), mode='constant', value=0)).unsqueeze(-1)  # pad right
+                right = x.as_strided(size=x_size, stride=x_stride)  # T, cls_num, num_bins
+                if self.multi_label:
+                    left = left.transpose(0, 1)  # T, cls_num, num_bins
+                    right = right.transpose(0, 1)  # T, cls_num, num_bins
             else:
-                pred_start_neighbours = None
-                pred_end_neighbours = None
+                left = None
+                right = None
 
-            decoded_offsets = self.decode_offset(offsets_i, pred_start_neighbours, pred_end_neighbours)
+            decoded_offsets = self.decode_offset(offsets_i, left, right)
 
-            # pick topk output from the prediction
-            if self.use_trident_head:
-                offsets = decoded_offsets[cls_idxs, pt_idxs]
+            if self.multi_label:
+                if self.use_trident_head:
+                    offsets = decoded_offsets[pt_idxs, cls_idxs]
+                else:
+                    offsets = decoded_offsets[pt_idxs, cls_idxs]
             else:
-                offsets = decoded_offsets[pt_idxs]
-
+                if self.use_trident_head:
+                    offsets = decoded_offsets[cls_idxs, pt_idxs]
+                else:
+                    offsets = decoded_offsets[pt_idxs]
             pts = pts_i[pt_idxs]
 
             # 4. compute predicted segments (denorm by stride for output offsets)

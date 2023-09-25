@@ -9,8 +9,9 @@ from torch.nn import functional as F
 from .datasets import register_dataset
 from .data_utils import truncate_feats
 
-@register_dataset("thumos")
-class THUMOS14Dataset(Dataset):
+
+@register_dataset("multithumos")
+class MultiTHUMOS14Dataset(Dataset):
     def __init__(
             self,
             is_training,  # if in training mode
@@ -28,9 +29,10 @@ class THUMOS14Dataset(Dataset):
             num_classes,  # number of action categories
             file_prefix,  # feature file prefix if any
             file_ext,  # feature file extension if any
-            force_upsampling,  # force to upsample to max_seq_len
+            force_upsampling,
             backbone_type,  # feat_type
-            additional_feat_folder=None
+            additional_feat_folder=None,
+            rgb_only=False,
     ):
         # file path
         assert os.path.exists(feat_folder) and os.path.exists(json_file)
@@ -41,7 +43,6 @@ class THUMOS14Dataset(Dataset):
             self.file_prefix = file_prefix
         else:
             self.file_prefix = ''
-        self.backbone_type = backbone_type
         self.file_ext = file_ext
         self.json_file = json_file
 
@@ -60,19 +61,21 @@ class THUMOS14Dataset(Dataset):
         self.num_classes = num_classes
         self.label_dict = None
         self.crop_ratio = crop_ratio
+        self.rgb_only = rgb_only
+        self.backbone_type = backbone_type
         self.use_addtional_feats = additional_feat_folder is not None
         self.additional_feat_folder = additional_feat_folder
 
         # load database and select the subset
         dict_db, label_dict = self._load_json_db(self.json_file)
-        assert num_classes == 1 or len(label_dict) == num_classes
+        assert len(label_dict) == num_classes
         self.data_list = dict_db
         self.label_dict = label_dict
 
         # dataset specific attributes
         self.db_attributes = {
             'dataset_name': 'thumos-14',
-            'tiou_thresholds': np.linspace(0.3, 0.7, 5),
+            'tiou_thresholds': np.linspace(0.1, 0.9, 9),
             # we will mask out cliff diving
             'empty_label_ids': [],
         }
@@ -126,10 +129,7 @@ class THUMOS14Dataset(Dataset):
                 segments, labels = [], []
                 for act in value['annotations']:
                     segments.append(act['segment'])
-                    if self.num_classes == 1:
-                        labels.append([0])
-                    else:
-                        labels.append([label_dict[act['label']]])
+                    labels.append([label_dict[act['label']]])
 
                 segments = np.asarray(segments, dtype=np.float32)
                 labels = np.squeeze(np.asarray(labels, dtype=np.int64), axis=1)
@@ -158,20 +158,14 @@ class THUMOS14Dataset(Dataset):
         filename = os.path.join(self.feat_folder,
                                 self.file_prefix + video_item['id'] + self.file_ext)
         feats = np.load(filename).astype(np.float32)
-
-        # deal with downsampling (= increased feat stride)
-        feats = feats[::self.downsample_rate, :]
-        feat_stride = self.feat_stride * self.downsample_rate
-        # T x C -> C x T
-        feats = torch.from_numpy(np.ascontiguousarray(feats.transpose()))
+        if self.rgb_only:
+            feats = feats[:, :1024]
 
         if self.use_addtional_feats:
             additional_file_name = self.file_prefix + video_item['id'] + '.npy'
-            # path_folder = '/CV/datasets/thumos14/pose_heatmap'
             additional_feats = np.load(
                 os.path.join(self.additional_feat_folder, additional_file_name))  # T, kpt_cls, height, width
             additional_feats = torch.from_numpy(additional_feats).to(torch.float32)
-
 
             if additional_feats.shape[0] == 1:
                 additional_feats = additional_feats.squeeze(0)
@@ -182,6 +176,12 @@ class THUMOS14Dataset(Dataset):
                 F.interpolate(additional_feats[None], feats.shape[-1], mode='linear', align_corners=True)[0]
         else:
             additional_feats = None
+
+        # deal with downsampling (= increased feat stride)
+        feats = feats[::self.downsample_rate, :]
+        feat_stride = self.feat_stride * self.downsample_rate
+        # T x C -> C x T
+        feats = torch.from_numpy(np.ascontiguousarray(feats.transpose()))
 
         # convert time stamp (in second) into temporal feature grids
         # ok to have small negative values here
