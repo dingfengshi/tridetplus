@@ -2,7 +2,7 @@ dataset_name: multithumos
 train_split: [ 'validation' ]
 val_split: [ 'test' ]
 dataset: {
-  json_file: ./data/thumos/annotations/multithumos.json,
+  json_file: ./data/multithumos/multithumos.json,
   feat_folder: /CV/datasets/thumos14/official_videomae2_feats,
   file_prefix: ~,
   file_ext: .npy,

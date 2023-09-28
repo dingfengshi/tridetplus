@@ -28,13 +28,17 @@ def remove_duplicate_annotations(ants, tol=1e-3):
     return valid_events
 
 
-def load_gt_seg_from_json(json_file, split=None, label='label_id', label_offset=0):
+def load_gt_seg_from_json(json_file, split=None, label='label_id', label_offset=0, ignore_cls=False):
     # load json file
     with open(json_file, "r", encoding="utf8") as f:
         json_db = json.load(f)
     json_db = json_db['database']
 
     vids, starts, stops, labels = [], [], [], []
+
+    # todo add instance id
+    instances = []
+    instances_num = 0
     for k, v in json_db.items():
 
         # filter based on split
@@ -48,19 +52,25 @@ def load_gt_seg_from_json(json_file, split=None, label='label_id', label_offset=
         for event in ants:
             starts += [float(event['segment'][0])]
             stops += [float(event['segment'][1])]
-            if isinstance(event[label], (Tuple, List)):
-                # offset the labels by label_offset
+            if ignore_cls:
                 label_id = 0
-                for i, x in enumerate(event[label][::-1]):
-                    label_id += label_offset ** i + int(x)
             else:
-                # load label_id directly
-                label_id = int(event[label])
+                if isinstance(event[label], (Tuple, List)):
+                    # offset the labels by label_offset
+                    label_id = 0
+                    for i, x in enumerate(event[label][::-1]):
+                        label_id += label_offset ** i + int(x)
+                else:
+                    # load label_id directly
+                    label_id = int(event[label])
             labels += [label_id]
+            instances += [instances_num]
+            instances_num += 1
 
     # move to pd dataframe
     gt_base = pd.DataFrame({
         'video-id': vids,
+        'instance_id': instances,
         't-start': starts,
         't-end': stops,
         'label': labels
@@ -118,11 +128,13 @@ class ANETdetection(object):
             label_offset=0,
             num_workers=8,
             dataset_name=None,
+            ignore_cls=False
     ):
 
         self.tiou_thresholds = tiou_thresholds
         self.ap = None
         self.num_workers = num_workers
+        self.ignore_cls = ignore_cls
         if dataset_name is not None:
             self.dataset_name = dataset_name
         else:
@@ -131,11 +143,14 @@ class ANETdetection(object):
         # Import ground truth and predictions
         self.split = split
         self.ground_truth = load_gt_seg_from_json(
-            ant_file, split=self.split, label=label, label_offset=label_offset)
+            ant_file, split=self.split, label=label, label_offset=label_offset, ignore_cls=ignore_cls)
 
-        # remove labels that does not exists in gt
-        self.activity_index = {j: i for i, j in enumerate(sorted(self.ground_truth['label'].unique()))}
-        self.ground_truth['label'] = self.ground_truth['label'].replace(self.activity_index)
+        if not ignore_cls:
+            # remove labels that does not exists in gt
+            self.activity_index = {j: i for i, j in enumerate(sorted(self.ground_truth['label'].unique()))}
+            self.ground_truth['label'] = self.ground_truth['label'].replace(self.activity_index)
+        else:
+            self.activity_index = {"proposal": 0}
 
         # remove action instances with length=0
         self.ground_truth = self.ground_truth.drop(
@@ -173,6 +188,22 @@ class ANETdetection(object):
 
         return ap
 
+    def wrapper_get_tp_instance(self, preds):
+        """Computes average precision for each class in the subset.
+        """
+        # Adaptation to query faster
+        ground_truth_by_label = self.ground_truth.groupby('label')
+        prediction_by_label = preds.groupby('label')
+
+        results = get_tp_instances(
+            ground_truth=ground_truth_by_label.get_group(0).reset_index(drop=True),
+            prediction=self._get_predictions_with_label(prediction_by_label, "proposal", 0),
+            tiou_thresholds=0.6)
+
+        np.save("rgb_tp.npy", results)
+
+        return results
+
     def evaluate(self, preds, verbose=True):
         """Evaluates a prediction file. For the detection task we measure the
         interpolated mean average precision to measure the performance of a
@@ -199,7 +230,8 @@ class ANETdetection(object):
         self.ap = None
 
         # make the label ids consistent
-        preds['label'] = preds['label'].replace(self.activity_index)
+        if not self.ignore_cls:
+            preds['label'] = preds['label'].replace(self.activity_index)
 
         # compute mAP
         self.ap = self.wrapper_compute_average_precision(preds)
@@ -217,6 +249,9 @@ class ANETdetection(object):
                 block += '\n|tIoU = {:.2f}: mAP = {:.2f} (%)'.format(tiou, tiou_mAP * 100)
             print(block)
             print('Avearge mAP: {:.2f} (%)'.format(average_mAP * 100))
+
+        # get ap instance
+        # tp_res = self.wrapper_get_tp_instance(preds)
 
         # return the results
         return mAP, average_mAP
@@ -305,6 +340,47 @@ def compute_average_precision_detection(
     return ap
 
 
+# todo get tp instances
+def get_tp_instances(ground_truth, prediction, tiou_thresholds=0.6):
+    tp_instances_list = []
+    if prediction.empty:
+        return None
+
+    npos = float(len(ground_truth))
+    lock_gt = np.ones((len(ground_truth))) * -1
+    # Sort predictions by decreasing score order.
+    sort_idx = prediction['score'].values.argsort()[::-1]
+    prediction = prediction.loc[sort_idx].reset_index(drop=True)
+
+    # Adaptation to query faster
+    ground_truth_gbvn = ground_truth.groupby('video-id')
+
+    # Assigning true positive to truly ground truth instances.
+    for idx, this_pred in prediction.iterrows():
+        try:
+            # Check if there is at least one ground truth in the video associated.
+            ground_truth_videoid = ground_truth_gbvn.get_group(this_pred['video-id'])
+        except Exception as e:
+            continue
+
+        this_gt = ground_truth_videoid.reset_index()
+        tiou_arr = segment_iou(this_pred[['t-start', 't-end']].values,
+                               this_gt[['t-start', 't-end']].values)
+        # We would like to retrieve the predictions with highest tiou score.
+        tiou_sorted_idx = tiou_arr.argsort()[::-1]
+        for jdx in tiou_sorted_idx:
+            if tiou_arr[jdx] < tiou_thresholds:
+                break
+            if lock_gt[this_gt.loc[jdx]['index']] >= 0:
+                continue
+            # Assign as true positive after the filters above.
+            tp_instances_list.append(this_gt.loc[jdx]['instance_id'])
+            lock_gt[this_gt.loc[jdx]['index']] = idx
+            break
+
+    return tp_instances_list
+
+
 def segment_iou(target_segment, candidate_segments):
     """Compute the temporal intersection over union between a
     target segment and all the test segments.
@@ -330,8 +406,6 @@ def segment_iou(target_segment, candidate_segments):
     # over union of two segments.
     tIoU = segments_intersection.astype(float) / segments_union
 
-    if np.any(segments_union == 0) or np.any(np.isnan(segments_union)):
-        print(1)
     return tIoU
 
 

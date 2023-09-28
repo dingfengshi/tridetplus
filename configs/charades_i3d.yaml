@@ -2,7 +2,7 @@ dataset_name: charades
 train_split: [ 'train' ]
 val_split: [ 'test' ]
 dataset: {
-  json_file: /CV/datasets/charades/charades.json,
+  json_file: ./data/charades/charades.json,
   feat_folder: /CV/datasets/charades/Charades_v1_rgb_i3d,
   file_prefix: ~,
   file_ext: -rgb.npz,
