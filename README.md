@@ -27,7 +27,7 @@ cd ../..
 
 ## Data Preparation
 
-### The VideoMAEv2 feature on HACS dataset 
+### The VideoMAEv2 feature on the HACS dataset 
 The pre-extracted features can be downloaded from this [Link](https://pan.baidu.com/s/1TFcKiFONAu9rKiavKj4Q_w?pwd=fqsy) (Password: fqsy). They are extracted with window size 16 and stride 8.
 
 **Note**: Due to the large number of videos, it takes about a week to use 12 V100 GPUs to extract the features. To reduce extraction time, we used the VideoMAEv2 with half-precision weights to extract **some** features (obtained float16 features). Please convert the features to float32 when using:
@@ -35,6 +35,9 @@ The pre-extracted features can be downloaded from this [Link](https://pan.baidu.
 ```
 feats = np.load(feature_path).astype(np.float32)
 ```
+
+### The feature on the Charades dataset
+We adopt the official RGB feature ([here](https://prior.allenai.org/projects/charades)) for our experiments.
 
 ## References
 
