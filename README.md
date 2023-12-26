@@ -39,6 +39,9 @@ feats = np.load(feature_path).astype(np.float32)
 ### The feature on the Charades dataset
 We adopt the official RGB feature ([here](https://prior.allenai.org/projects/charades)) for our experiments. You can download it from [this link](https://ai2-public-datasets.s3-us-west-2.amazonaws.com/charades/Charades_v1_features_rgb.tar.gz)
 
+
+**Note:** We provide the json file for Charades and multithumos in the ```data``` folder.
+
 ## References
 
 If you find this work helpful, please consider citing our paper
