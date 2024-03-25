@@ -37,7 +37,8 @@ feats = np.load(feature_path).astype(np.float32)
 ```
 
 ### The feature on the Charades dataset
-[Update soon] The I3D feature for Charades
+The pre-extracted I3D features for Charades dataset can be downloaded from this [Link](https://pan.baidu.com/s/1VjZdfE5o1u5Jq6nnDIQQOQ?pwd=ixuq) (Password: ixuq). They are extracted with window size 16 and stride 4.
+
 
 
 **Note:** We provide the json file for Charades and multithumos in the ```data``` folder.
